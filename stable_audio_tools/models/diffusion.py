@@ -575,6 +575,95 @@ class DiTUncondWrapper(DiffusionModel):
     def forward(self, x, t, **kwargs):
         return self.model(x, t, **kwargs)
 
+from .dir import DiffusionRWKV7
+from .rwkv7 import RWKV7Config
+
+class DiRWrapper(ConditionedDiffusionModel):
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):
+        super().__init__(supports_cross_attention=True, supports_global_cond=False, supports_input_concat=False)
+        print(kwargs)
+        print(args)
+        #{'diffusion_objective': 'v', 'attn_mode': 'chunk', 'hidden_size': 2048, 'hidden_ratio': 4, 'num_hidden_layers': 24, 'head_dim': 64, 'decay_low_rank_dim': 96, 'gate_low_rank_dim': 256, 'a_low_rank_dim': 96, 'v_low_rank_dim': 64, 'hidden_act': 'sqrelu', 'max_position_embeddings': 2048, 'norm_first': True, 'norm_bias': True, 'norm_eps': 1e-05, 'use_cache': True, 'initializer_range': 0.02, 'fuse_norm': False, 'fuse_cross_entropy': True, 'vocab_size': 65536, 'bos_token_id': 1, 'eos_token_id': 2, 'pad_token_id': 0, 'intermediate_size': 8192, 'cond_token_dim': 768, 'global_cond_dim': 1536, 'patch_size': 1}
+        config = RWKV7Config(attn_mode=kwargs['attn_mode'], 
+                        hidden_size=kwargs['hidden_size'], 
+                        num_hidden_layers=kwargs['num_hidden_layers'], 
+                        head_dim=kwargs['head_dim'], 
+                        decay_low_rank_dim=kwargs['decay_low_rank_dim'], 
+                        gate_low_rank_dim=kwargs['gate_low_rank_dim'], 
+                        a_low_rank_dim=kwargs['a_low_rank_dim'], 
+                        v_low_rank_dim=kwargs['v_low_rank_dim'], 
+                        hidden_act=kwargs['hidden_act'], 
+                        max_position_embeddings=kwargs['max_position_embeddings'], 
+                        norm_first=kwargs['norm_first'], 
+                        norm_bias=kwargs['norm_bias'], 
+                        norm_eps=kwargs['norm_eps'], 
+                        use_cache=kwargs['use_cache'], 
+                        initializer_range=kwargs['initializer_range'], 
+                        fuse_norm=kwargs['fuse_norm'], 
+                        fuse_cross_entropy=kwargs['fuse_cross_entropy'], 
+                        vocab_size=kwargs['vocab_size'], 
+                        bos_token_id=kwargs['bos_token_id'], 
+                        eos_token_id=kwargs['eos_token_id'], 
+                        pad_token_id=kwargs['pad_token_id'], 
+                        intermediate_size=kwargs['intermediate_size'])
+        cond_token_dim=kwargs['cond_token_dim']
+        global_cond_dim=kwargs['global_cond_dim']
+        patch_size=kwargs['patch_size']
+        io_channels=kwargs['io_channels']
+        project_cond_tokens=kwargs['project_cond_tokens']
+        self.model = DiffusionRWKV7(config, 
+                                    io_channels=io_channels, 
+                                    project_cond_tokens=project_cond_tokens, 
+                                    patch_size=patch_size,
+                                    cond_token_dim=cond_token_dim,
+                                    global_cond_dim=global_cond_dim)
+
+        with torch.no_grad():
+            for param in self.model.parameters():
+                param *= 0.5
+
+    def forward(self,
+                x,
+                t,
+                cross_attn_cond=None,
+                cross_attn_mask=None,
+                negative_cross_attn_cond=None,
+                negative_cross_attn_mask=None,
+                input_concat_cond=None,
+                negative_input_concat_cond=None,
+                global_cond=None,
+                negative_global_cond=None,
+                prepend_cond=None,
+                prepend_cond_mask=None,
+                cfg_scale=1.0,
+                cfg_dropout_prob: float = 0.0,
+                batch_cfg: bool = True,
+                rescale_cfg: bool = False,
+                scale_phi: float = 0.0,
+                **kwargs):
+
+        assert batch_cfg, "batch_cfg must be True for DiRWrapper"
+
+        return self.model(
+            x,
+            t,
+            cross_attn_cond=cross_attn_cond,
+            cross_attn_cond_mask=cross_attn_mask,
+            negative_cross_attn_cond=negative_cross_attn_cond,
+            negative_cross_attn_mask=negative_cross_attn_mask,
+            input_concat_cond=input_concat_cond,
+            prepend_cond=prepend_cond,
+            prepend_cond_mask=prepend_cond_mask,
+            cfg_scale=cfg_scale,
+            cfg_dropout_prob=cfg_dropout_prob,
+            scale_phi=scale_phi,
+            global_embed=global_cond,
+            **kwargs)
+
 def create_diffusion_uncond_from_config(config: tp.Dict[str, tp.Any]):
     diffusion_uncond_config = config["model"]
 
@@ -648,6 +737,8 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         diffusion_model = UNet1DCondWrapper(**diffusion_model_config)
     elif diffusion_model_type == 'dit':
         diffusion_model = DiTWrapper(diffusion_objective=diffusion_objective, **diffusion_model_config)
+    elif diffusion_model_type == 'dir':
+        diffusion_model = DiRWrapper(diffusion_objective=diffusion_objective, **diffusion_model_config)
 
     io_channels = model_config.get('io_channels', None)
     assert io_channels is not None, "Must specify io_channels in model config"
@@ -667,9 +758,12 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
 
     if pretransform is not None:
         pretransform = create_pretransform_from_config(pretransform, sample_rate)
-        min_input_length = pretransform.downsampling_ratio
-    else:
-        min_input_length = 1
+        if hasattr(pretransform, 'downsampling_ratio'):
+            min_input_length = pretransform.downsampling_ratio
+        else:
+            min_input_length = 1
+            for r in pretransform.pretrained_vae.downsampling_ratios:
+                min_input_length *= r
 
     conditioning_config = model_config.get('conditioning', None)
 
@@ -679,7 +773,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
 
     if diffusion_model_type == "adp_cfg_1d" or diffusion_model_type == "adp_1d":
         min_input_length *= np.prod(diffusion_model_config["factors"])
-    elif diffusion_model_type == "dit":
+    elif diffusion_model_type == "dit" or diffusion_model_type == "dir":
         min_input_length *= diffusion_model.model.patch_size
 
     # Get the proper wrapper class

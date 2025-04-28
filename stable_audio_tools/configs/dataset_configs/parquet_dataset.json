@@ -1,0 +1,6 @@
+{
+    "dataset_type": "parquet",
+    "datasets": "/data/training/freesound-laion-640k/data/",
+    "random_crop": true,
+    "drop_last": true
+}

@@ -11,6 +11,7 @@ import time
 import torch
 import torchaudio
 import webdataset as wds
+import datasets
 
 from os import path
 from torch import nn
@@ -851,7 +852,21 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
 
         return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
                                 num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+    elif dataset_type == "parquet":
+        parquet_paths = dataset_config.get("datasets", None)
+        assert parquet_paths is not None, "Parquet paths must be specified in datasets[\"dataset\"]"
 
+        train_set = ParquetSampleDataset(parquet_paths,
+                                        sample_size=sample_size,
+                                        sample_rate=sample_rate,
+                                        random_crop=dataset_config.get("random_crop", True),
+                                        force_channels=force_channels
+        )
+
+        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
+                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+        
+        
     elif dataset_type == "pre_encoded":
 
         pre_encoded_dir_configs = dataset_config.get("datasets", None)
@@ -958,3 +973,96 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             latent_crop_length=dataset_config.get("latent_crop_length", None),
             resampled_shards=dataset_config.get("resampled_shards", True)
         ).data_loader
+
+class ParquetSampleDataset(torch.utils.data.Dataset):
+    def __init__(
+        self, 
+        parquet_paths,
+        sample_size=65536, 
+        sample_rate=48000, 
+        random_crop=True,
+        force_channels="stereo"
+    ):
+        super().__init__()
+        
+        self.sample_size = sample_size
+        self.sr = sample_rate
+        self.random_crop = random_crop
+        self.force_channels = force_channels
+        
+        # 初始化音频处理组件
+        self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
+        self.augs = torch.nn.Sequential(
+            PhaseFlipper()
+        )
+        self.encoding = torch.nn.Sequential(
+            Stereo() if force_channels == "stereo" else torch.nn.Identity(),
+            Mono() if force_channels == "mono" else torch.nn.Identity(),
+        )
+        
+        # 加载 parquet 数据
+        if isinstance(parquet_paths, str) and os.path.isdir(parquet_paths):
+            self.parquet_paths = [os.path.join(parquet_paths, f) for f in os.listdir(parquet_paths) if f.endswith('.parquet')]
+        else:
+            self.parquet_paths = parquet_paths if isinstance(parquet_paths, list) else [parquet_paths]
+        self.dataset = datasets.load_dataset('parquet', data_files=self.parquet_paths)['train']
+        
+        print(f'Loaded {len(self.dataset)} samples from parquet files')
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        try:
+            start_time = time.time()
+            sample = self.dataset[idx]
+            
+            # 加载音频数据
+            audio_data = sample['audio']['array']
+            audio = torch.from_numpy(audio_data).float()
+            if len(audio.shape) == 1:
+                audio = audio.unsqueeze(0)  # 确保是 [channels, samples] 格式
+            
+            # 重采样
+            if sample['audio']['sampling_rate'] != self.sr:
+                resample_tf = T.Resample(sample['audio']['sampling_rate'], self.sr)
+                audio = resample_tf(audio)
+            
+            # 应用裁剪
+            audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
+            
+            # 检查静音
+            if is_silence(audio):
+                return self[random.randrange(len(self))]
+            
+            # 应用增强
+            if self.augs is not None:
+                audio = self.augs(audio)
+            
+            audio = audio.clamp(-1, 1)
+            
+            # 应用通道转换
+            if self.encoding is not None:
+                audio = self.encoding(audio)
+            
+            # 构建元数据
+            info = {}
+            info["path"] = sample['audio']['path']
+            info["timestamps"] = (t_start, t_end)
+            info["seconds_start"] = seconds_start
+            info["seconds_total"] = seconds_total
+            info["padding_mask"] = padding_mask
+            info["sample_rate"] = self.sr
+            
+            # 构建 prompt
+            description = sample.get('description', '')
+            tags = sample.get('tags', [])
+            info["prompt"] = description.strip() + ' ' + ' '.join(tags)
+            
+            end_time = time.time()
+            info["load_time"] = end_time - start_time
+            
+            return (audio, info)
+        except Exception as e:
+            print(f'Error loading sample {idx}: {e}')
+            return self[random.randrange(len(self))]

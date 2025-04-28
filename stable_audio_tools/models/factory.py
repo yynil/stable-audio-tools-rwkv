@@ -76,6 +76,10 @@ def create_pretransform_from_config(pretransform_config, sample_rate):
 
         patched_config = pretransform_config["config"]
         pretransform = PatchedPretransform(**patched_config)
+    elif pretransform_type == "AutoencoderOobleck":
+        from .pretrained_vae import PretrainedVAEWrapper
+        autoencoder_oobleck = PretrainedVAEWrapper(pretransform_config["config"]["pretrained_model_path"])
+        pretransform = autoencoder_oobleck
     else:
         raise NotImplementedError(f'Unknown pretransform type: {pretransform_type}')
     

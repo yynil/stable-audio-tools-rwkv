@@ -9,28 +9,34 @@
             "iterate_batch": true,
             "config": {
                 "encoder": {
-                    "type": "dac",
+                    "type": "oobleck",
+                    "requires_grad": false,
                     "config": {
                         "in_channels": 2,
+                        "channels": 128,
+                        "c_mults": [1, 2, 4, 8, 16],
+                        "strides": [2, 4, 4, 8, 8],
                         "latent_dim": 128,
-                        "d_model": 128,
-                        "strides": [4, 4, 8, 8]
+                        "use_snake": true
                     }
                 },
                 "decoder": {
-                    "type": "dac",
+                    "type": "oobleck",
                     "config": {
                         "out_channels": 2,
+                        "channels": 128,
+                        "c_mults": [1, 2, 4, 8, 16],
+                        "strides": [2, 4, 4, 8, 8],
                         "latent_dim": 64,
-                        "channels": 1536,
-                        "rates": [8, 8, 4, 4]
+                        "use_snake": true,
+                        "final_tanh": false
                     }
                 },
                 "bottleneck": {
                     "type": "vae"
                 },
                 "latent_dim": 64,
-                "downsampling_ratio": 1024,
+                "downsampling_ratio": 2048,
                 "io_channels": 2
             }
         },

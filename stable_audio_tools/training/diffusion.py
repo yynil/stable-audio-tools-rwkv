@@ -339,7 +339,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         # Create batch tensor of attention masks from the "mask" field of the metadata array
         if use_padding_mask:
-            padding_masks = torch.stack([md["padding_mask"][0] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
+            padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
 
         p.tick("conditioning")
 

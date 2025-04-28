@@ -1,0 +1,116 @@
+{
+    "model_type": "diffusion_cond",
+    "sample_size": 1440000,
+    "sample_rate": 48000,
+    "audio_channels": 2,
+    "model": {
+        "pretransform": {
+            "type": "AutoencoderOobleck",
+            "iterate_batch": true,
+            "config": {
+                "pretrained_model_path": "/external_data/models/stable-audio-open-1.0/vae/"
+            }
+        },
+        "conditioning": {
+            "configs": [
+                {
+                    "id": "prompt",
+                    "type": "t5",
+                    "config": {
+                        "t5_model_name": "/external_data/models/t5-base",
+                        "max_length": 128
+                    }
+                },
+                {
+                    "id": "seconds_start",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 512
+                    }
+                },
+                {
+                    "id": "seconds_total",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 512
+                    }
+                }
+            ],
+            "cond_dim": 768
+        },
+        "diffusion": {
+            "cross_attention_cond_ids": ["prompt", "seconds_start", "seconds_total"],
+            "global_cond_ids": ["seconds_start", "seconds_total"],
+            "type": "dir",
+            "config": {
+                "attn_mode": "chunk",
+                "hidden_size": 1024,
+                "hidden_ratio": 4,
+                "num_hidden_layers": 12,
+                "head_dim": 64,
+                "decay_low_rank_dim": 96,
+                "gate_low_rank_dim": 256,
+                "a_low_rank_dim": 96,
+                "v_low_rank_dim": 64,
+                "hidden_act": "sqrelu",
+                "max_position_embeddings": 2048,
+                "norm_first": true,
+                "norm_bias": true,
+                "norm_eps": 1e-5,
+                "use_cache": true,
+                "initializer_range": 0.02,
+                "fuse_norm": false,
+                "fuse_cross_entropy": true,
+                "vocab_size": 65536,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "pad_token_id": 0,
+                "intermediate_size": 8192,
+                "cond_token_dim": 768,
+                "global_cond_dim": 1536,
+                "patch_size": 1,
+                "io_channels": 64,
+                "project_cond_tokens": false
+            }
+        },
+        "io_channels": 64
+    },
+    "training": {
+        "use_ema": true,
+        "log_loss_info": false,
+        "optimizer_configs": {
+            "diffusion": {
+                "optimizer": {
+                    "type": "AdamW",
+                    "config": {
+                        "lr": 5e-5,
+                        "betas": [0.9, 0.999],
+                        "weight_decay": 1e-3
+                    }
+                },
+                "scheduler": {
+                    "type": "InverseLR",
+                    "config": {
+                        "inv_gamma": 1000000,
+                        "power": 0.5,
+                        "warmup": 0.99
+                    }
+                }
+            }
+        },
+        "demo": {
+            "demo_every": 100,
+            "demo_steps": 250,
+            "num_demos": 4,
+            "demo_cond": [
+                {"prompt": "A beautiful piano arpeggio", "seconds_start": 0, "seconds_total": 80},
+                {"prompt": "A tropical house track with upbeat melodies, a driving bassline, and cheery vibes", "seconds_start": 0, "seconds_total": 250},
+                {"prompt": "A cool 80s glam rock song with driving drums and distorted guitars", "seconds_start": 0, "seconds_total": 180},
+                {"prompt": "A grand orchestral arrangement with thunderous percussion, epic brass fanfares, and soaring strings, creating a cinematic atmosphere fit for a heroic battle.", "seconds_start": 0, "seconds_total": 190}
+            ],
+            "demo_cfg_scales": [3, 6, 9]
+        }
+    }
+}
