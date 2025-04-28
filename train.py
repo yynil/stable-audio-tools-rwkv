@@ -12,6 +12,11 @@ from stable_audio_tools.training.utils import copy_state_dict
 
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
+        if module.device == 'cuda:0':
+            #print module's datatype
+            for name, param in module.named_parameters():
+                print(f'{name}: {param.dtype}, is_grad :{param.requires_grad}, device: {param.device}')
+        print(f'type(err): {type(err)}')
         print(f'{type(err).__name__}: {err}')
 
 class ModelConfigEmbedderCallback(pl.Callback):
@@ -128,7 +133,8 @@ def main():
                                         reduce_scatter=True,
                                         reduce_bucket_size=5e8,
                                         allgather_bucket_size=5e8,
-                                        load_full_weights=True)
+                                        load_full_weights=True
+                                        )
         else:
             strategy = args.strategy
     else:

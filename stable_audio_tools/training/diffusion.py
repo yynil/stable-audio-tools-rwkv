@@ -130,6 +130,33 @@ class DiffusionUncondTrainingWrapper(pl.LightningModule):
 
             loss, losses = self.losses(loss_info)
 
+            # 只在返回时转换为模型精度
+            if hasattr(self.trainer, 'precision') and self.trainer.precision == "bf16-mixed":
+                loss = loss.to(torch.bfloat16)
+                for name in losses:
+                    losses[name] = losses[name].to(torch.bfloat16)
+
+            if self.log_loss_info:
+                # Loss debugging logs
+                num_loss_buckets = 10
+                bucket_size = 1 / num_loss_buckets
+                loss_all = F.mse_loss(v, targets, reduction="none")
+
+                sigmas = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n").squeeze()
+
+                # gather loss_all across all GPUs
+                loss_all = rearrange(self.all_gather(loss_all), "w b c n -> (w b) c n")
+
+                # Bucket loss values based on corresponding sigma values, bucketing sigma values by bucket_size
+                loss_all = torch.stack([loss_all[(sigmas >= i) & (sigmas < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
+
+                # Log bucketed losses with corresponding sigma bucket values, if it's not NaN
+                debug_log_dict = {
+                    f"model/loss_all_{i/num_loss_buckets:.1f}": loss_all[i].detach() for i in range(num_loss_buckets) if not torch.isnan(loss_all[i])
+                }
+
+                self.log_dict(debug_log_dict)
+
         log_dict = {
             'train/loss': loss.detach(),
             'train/std_data': diffusion_input.std(),
@@ -347,7 +374,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             self.diffusion.pretransform.to(self.device)
 
             if not self.pre_encoded:
-                with torch.cuda.amp.autocast() and torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
+                with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
                     self.diffusion.pretransform.train(self.diffusion.pretransform.enable_grad)
 
                     diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
@@ -449,7 +476,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
         p.tick("log")
-        #print(f"Profiler: {p}")
+        print(f"loss: {loss}, losses: {losses} dtype: {loss.dtype}")
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -972,53 +999,64 @@ class DiffusionCondInpaintTrainingWrapper(pl.LightningModule):
         alphas = alphas[:, None, None]
         sigmas = sigmas[:, None, None]
         noise = torch.randn_like(diffusion_input)
-        noised_inputs = diffusion_input * alphas + noise * sigmas
+        noised_reals = reals * alphas + noise * sigmas
+        targets = noise * alphas - reals * sigmas
 
-        if self.diffusion_objective == "v":
-            targets = noise * alphas - diffusion_input * sigmas
-        elif self.diffusion_objective == "rectified_flow":
-            targets = noise - diffusion_input
+        with torch.cuda.amp.autocast():
+            v = self.diffusion(noised_reals, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
 
-        p.tick("noise")
+            loss_info.update({
+                "v": v,
+                "targets": targets
+            })
 
-        extra_args = {}
+            if self.use_reconstruction_loss:
+                pred = noised_reals * alphas - v * sigmas
 
-        #with torch.cuda.amp.autocast():
-        p.tick("amp")
-        output = self.diffusion(noised_inputs, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
-        p.tick("diffusion")
+                loss_info["pred"] = pred
 
-        loss_info.update({
-            "output": output,
-            "targets": targets,
-        })
+                if self.diffusion.pretransform is not None:
+                    pred = self.diffusion.pretransform.decode(pred)
+                    loss_info["audio_pred"] = pred
 
-        loss, losses = self.losses(loss_info)
+                if self.audio_out_channels == 2:
+                    loss_info["pred_left"] = pred[:, 0:1, :]
+                    loss_info["pred_right"] = pred[:, 1:2, :]
+                    loss_info["audio_reals_left"] = loss_info["audio_reals"][:, 0:1, :]
+                    loss_info["audio_reals_right"] = loss_info["audio_reals"][:, 1:2, :]
 
-        if self.log_loss_info:
-            # Loss debugging logs
-            num_loss_buckets = 10
-            bucket_size = 1 / num_loss_buckets
-            loss_all = F.mse_loss(output, targets, reduction="none")
+            loss, losses = self.losses(loss_info)
 
-            sigmas = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n").squeeze()
+            # 只在返回时转换为模型精度
+            if hasattr(self.trainer, 'precision') and self.trainer.precision == "bf16-mixed":
+                loss = loss.to(torch.bfloat16)
+                for name in losses:
+                    losses[name] = losses[name].to(torch.bfloat16)
 
-            # gather loss_all across all GPUs
-            loss_all = rearrange(self.all_gather(loss_all), "w b c n -> (w b) c n")
+            if self.log_loss_info:
+                # Loss debugging logs
+                num_loss_buckets = 10
+                bucket_size = 1 / num_loss_buckets
+                loss_all = F.mse_loss(v, targets, reduction="none")
 
-            # Bucket loss values based on corresponding sigma values, bucketing sigma values by bucket_size
-            loss_all = torch.stack([loss_all[(sigmas >= i) & (sigmas < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
+                sigmas = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n").squeeze()
 
-            # Log bucketed losses with corresponding sigma bucket values, if it's not NaN
-            debug_log_dict = {
-                f"model/loss_all_{i/num_loss_buckets:.1f}": loss_all[i].detach() for i in range(num_loss_buckets) if not torch.isnan(loss_all[i])
-            }
+                # gather loss_all across all GPUs
+                loss_all = rearrange(self.all_gather(loss_all), "w b c n -> (w b) c n")
 
-            self.log_dict(debug_log_dict)
+                # Bucket loss values based on corresponding sigma values, bucketing sigma values by bucket_size
+                loss_all = torch.stack([loss_all[(sigmas >= i) & (sigmas < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
+
+                # Log bucketed losses with corresponding sigma bucket values, if it's not NaN
+                debug_log_dict = {
+                    f"model/loss_all_{i/num_loss_buckets:.1f}": loss_all[i].detach() for i in range(num_loss_buckets) if not torch.isnan(loss_all[i])
+                }
+
+                self.log_dict(debug_log_dict)
 
         log_dict = {
             'train/loss': loss.detach(),
-            'train/std_data': diffusion_input.std(),
+            'train/std_data': reals.std(),
             'train/lr': self.trainer.optimizers[0].param_groups[0]['lr']
         }
 
@@ -1027,7 +1065,7 @@ class DiffusionCondInpaintTrainingWrapper(pl.LightningModule):
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
         p.tick("log")
-        #print(f"Profiler: {p}")
+        print(f"loss: {loss}, losses: {losses} dtype: {loss.dtype}")
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -1291,7 +1329,40 @@ class DiffusionAutoencoderTrainingWrapper(pl.LightningModule):
                     pred = self.diffae.pretransform.decode(pred)
                     loss_info["audio_pred"] = pred
 
+                if self.audio_out_channels == 2:
+                    loss_info["pred_left"] = pred[:, 0:1, :]
+                    loss_info["pred_right"] = pred[:, 1:2, :]
+                    loss_info["audio_reals_left"] = loss_info["audio_reals"][:, 0:1, :]
+                    loss_info["audio_reals_right"] = loss_info["audio_reals"][:, 1:2, :]
+
             loss, losses = self.losses(loss_info)
+
+            # 只在返回时转换为模型精度
+            if hasattr(self.trainer, 'precision') and self.trainer.precision == "bf16-mixed":
+                loss = loss.to(torch.bfloat16)
+                for name in losses:
+                    losses[name] = losses[name].to(torch.bfloat16)
+
+            if self.log_loss_info:
+                # Loss debugging logs
+                num_loss_buckets = 10
+                bucket_size = 1 / num_loss_buckets
+                loss_all = F.mse_loss(v, targets, reduction="none")
+
+                sigmas = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n").squeeze()
+
+                # gather loss_all across all GPUs
+                loss_all = rearrange(self.all_gather(loss_all), "w b c n -> (w b) c n")
+
+                # Bucket loss values based on corresponding sigma values, bucketing sigma values by bucket_size
+                loss_all = torch.stack([loss_all[(sigmas >= i) & (sigmas < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
+
+                # Log bucketed losses with corresponding sigma bucket values, if it's not NaN
+                debug_log_dict = {
+                    f"model/loss_all_{i/num_loss_buckets:.1f}": loss_all[i].detach() for i in range(num_loss_buckets) if not torch.isnan(loss_all[i])
+                }
+
+                self.log_dict(debug_log_dict)
 
         log_dict = {
             'train/loss': loss.detach(),
@@ -1347,6 +1418,8 @@ class DiffusionAutoencoderDemoCallback(pl.Callback):
         # Remove extra dimension added by WebDataset
         if demo_reals.ndim == 4 and demo_reals.shape[0] == 1:
             demo_reals = demo_reals[0]
+
+        demo_reals = demo_reals.to(module.device)
 
         encoder_input = demo_reals
 
@@ -1593,6 +1666,12 @@ class DiffusionPriorTrainingWrapper(pl.LightningModule):
                     loss_info["audio_reals_right"] = loss_info["audio_reals"][:, 1:2, :]
 
             loss, losses = self.losses(loss_info)
+
+            # 只在返回时转换为模型精度
+            if hasattr(self.trainer, 'precision') and self.trainer.precision == "bf16-mixed":
+                loss = loss.to(torch.bfloat16)
+                for name in losses:
+                    losses[name] = losses[name].to(torch.bfloat16)
 
             if self.log_loss_info:
                 # Loss debugging logs

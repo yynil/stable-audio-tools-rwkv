@@ -8,6 +8,10 @@ from typing import Optional, Tuple, Union, Literal
 import math
 from einops import rearrange
 import torch.nn.functional as F
+import logging
+import os
+logger = logging.getLogger(__name__)
+logger.setLevel(level=logging.DEBUG if os.environ.get("DEBUG", "false").lower() == "true" else logging.WARNING)
 
 class FourierFeatures(nn.Module):
     def __init__(self, in_features, out_features, std=1.):
@@ -129,14 +133,15 @@ class DiffusionRWKV7(nn.Module):
         return_info: bool = False,
         **kwargs
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        logger.info(f"x: {x.shape}")
         # 处理交叉注意力条件
         if cross_attn_cond is not None:
             cross_attn_cond = self.to_cond_embed(cross_attn_cond)
-            
+            logger.debug(f"cross_attn_cond: {cross_attn_cond.shape}")
         # 处理全局条件
         if global_embed is not None:
             global_embed = self.to_global_embed(global_embed)
-            
+            logger.debug(f"global_embed: {global_embed.shape}")
         # 处理前置条件
         prepend_inputs = None
         prepend_mask = None
@@ -155,7 +160,7 @@ class DiffusionRWKV7(nn.Module):
             
         # 处理时间步嵌入
         timestep_embed = self.to_timestep_embed(self.timestep_features(t[:, None]))
-        
+        logger.debug(f"timestep_embed: {timestep_embed.shape} and timestep_cond_type: {self.timestep_cond_type}")
         if self.timestep_cond_type == "global":
             if global_embed is not None:
                 global_embed = global_embed + timestep_embed
@@ -189,7 +194,7 @@ class DiffusionRWKV7(nn.Module):
         if self.patch_size > 1:
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
             
-        
+        logger.debug(f"x: {x.shape} before rwkv")
             
         x = self.rwkv(
             x,
@@ -203,13 +208,13 @@ class DiffusionRWKV7(nn.Module):
             **extra_args,
             **kwargs
         )
-        
+        logger.debug(f"x: {x.shape} after rwkv")
         if return_info:
             x, info = x
             
         # 后处理
         x = rearrange(x, "b t c -> b c t")[:, :, prepend_length:]
-        
+        logger.debug(f"x: {x.shape} after postprocess")
         if self.patch_size > 1:
             x = rearrange(x, "b (c p) t -> b c (t p)", p=self.patch_size)
             
@@ -217,7 +222,7 @@ class DiffusionRWKV7(nn.Module):
         
         if return_info:
             return x, info
-            
+
         return x
         
     def forward(

@@ -43,7 +43,7 @@ class InverseLR(torch.optim.lr_scheduler._LRScheduler):
             raise ValueError('Invalid value for warmup')
         self.warmup = warmup
         self.final_lr = final_lr
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
