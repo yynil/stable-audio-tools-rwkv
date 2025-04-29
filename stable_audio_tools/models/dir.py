@@ -119,6 +119,10 @@ class DiffusionRWKV7(nn.Module):
         self.postprocess_conv = nn.Conv1d(io_channels, io_channels, 1, bias=False)
         nn.init.zeros_(self.postprocess_conv.weight)
         
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+    
     def _forward(
         self,
         x: torch.Tensor,

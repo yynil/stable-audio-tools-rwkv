@@ -181,21 +181,22 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
         t = dist_shift.time_shift(t, x.shape[-1])
 
     alphas, sigmas = get_alphas_sigmas(t)
-
+    # print(f"model dtype: {model.model.dtype}")
     # The sampling loop
     for i in trange(steps):
+        with torch.amp.autocast(device_type=x.device.type, dtype=model.model.dtype):
+            if cfg_pp:
+                # Get the model output (v, the predicted velocity)
+                v, info = model(x, ts * t[i], return_info=True, **extra_args)
 
-        if cfg_pp:
-            # Get the model output (v, the predicted velocity)
-            v, info = model(x, ts * t[i], return_info=True, **extra_args)
-
-            if "uncond_output" in info:
-                v_eps = info["uncond_output"]
+                if "uncond_output" in info:
+                    v_eps = info["uncond_output"]
+                else:
+                    v_eps = v
             else:
+                # print(f"x: {x.dtype}, ts: {ts.dtype}, t[i]: {t[i].dtype}")
+                v = model(x, ts * t[i], **extra_args)
                 v_eps = v
-        else:
-            v = model(x, ts * t[i], **extra_args)
-            v_eps = v
 
         # Predict the noise and the denoised data
         pred = x * alphas[i] - v * sigmas[i]

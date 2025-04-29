@@ -343,7 +343,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         reals, metadata = batch
-
+        reals = reals.to(dtype=torch.bfloat16)
         p = Profiler()
 
         if reals.ndim == 4 and reals.shape[0] == 1:
@@ -352,7 +352,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         loss_info = {}
 
         diffusion_input = reals
-
+        # print(f"diffusion_input: {diffusion_input.dtype}")
         if not self.pre_encoded:
             loss_info["audio_reals"] = diffusion_input
 
@@ -360,24 +360,22 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         #with torch.amp.autocast(device_type="cuda"):
         conditioning = self.diffusion.conditioner(metadata, self.device)
-
+        # print(f'conditioning prompt: {conditioning["prompt"][0].dtype}')
         # If mask_padding is on, randomly drop the padding masks to allow for learning silence padding
         use_padding_mask = self.mask_padding and random.random() > self.mask_padding_dropout
 
         # Create batch tensor of attention masks from the "mask" field of the metadata array
         if use_padding_mask:
             padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
-
         p.tick("conditioning")
 
         if self.diffusion.pretransform is not None:
-            self.diffusion.pretransform.to(self.device)
-
+            # print(f"pretransform: {self.diffusion.pretransform.pretrained_vae.dtype}")
             if not self.pre_encoded:
                 with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
                     self.diffusion.pretransform.train(self.diffusion.pretransform.enable_grad)
-
                     diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
+                    # print(f"diffusion_input after encode: {diffusion_input.dtype}")
                     p.tick("pretransform")
 
                     # If mask_padding is on, interpolate the padding masks to the size of the pretransformed input
@@ -401,28 +399,29 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             t = 1 - t
         else:
             raise ValueError(f"Invalid timestep_sampler: {self.timestep_sampler}")
-
+        t = t.to(dtype=torch.bfloat16)
+        # print(f"t: {t.dtype}")
         if self.diffusion.dist_shift is not None:
             # Shift the distribution
             t = self.diffusion.dist_shift.time_shift(t, reals.shape[2])
-
+            # print(f"t after dist_shift: {t.dtype}")
         # Calculate the noise schedule parameters for those timesteps
         if self.diffusion_objective in ["v"]:
             alphas, sigmas = get_alphas_sigmas(t)
         elif self.diffusion_objective == "rectified_flow":
             alphas, sigmas = 1-t, t
-
+        # print(f"alphas: {alphas.dtype}, sigmas: {sigmas.dtype}")
         # Combine the ground truth data and the noise
         alphas = alphas[:, None, None]
         sigmas = sigmas[:, None, None]
-        noise = torch.randn_like(diffusion_input)
+        noise = torch.randn_like(diffusion_input,dtype=torch.bfloat16)
         noised_inputs = diffusion_input * alphas + noise * sigmas
-
+        # print(f"noised_inputs: {noised_inputs.dtype}")
         if self.diffusion_objective == "v":
             targets = noise * alphas - diffusion_input * sigmas
         elif self.diffusion_objective == "rectified_flow":
             targets = noise - diffusion_input
-
+        # print(f"targets: {targets.dtype}")  
         p.tick("noise")
 
         extra_args = {}
@@ -432,17 +431,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         output = self.diffusion(noised_inputs, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
         p.tick("diffusion")
-
+        # print(f"output: {output.dtype}")
         loss_info.update({
             "output": output,
             "targets": targets,
             "padding_mask": padding_masks if use_padding_mask else None,
         })
-
         loss, losses = self.losses(loss_info)
-
         p.tick("loss")
-
         if self.log_loss_info:
             # Loss debugging logs
             num_loss_buckets = 10
@@ -468,7 +464,6 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         log_dict = {
             'train/loss': loss.detach(),
             'train/std_data': diffusion_input.std(),
-            'train/lr': self.trainer.optimizers[0].param_groups[0]['lr']
         }
 
         for loss_name, loss_value in losses.items():
@@ -476,7 +471,6 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
         p.tick("log")
-        print(f"loss: {loss}, losses: {losses} dtype: {loss.dtype}")
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -624,14 +618,11 @@ class DiffusionCondDemoCallback(pl.Callback):
     @rank_zero_only
     @torch.no_grad()
     def on_train_batch_end(self, trainer, module: DiffusionCondTrainingWrapper, outputs, batch, batch_idx):
-
-        if (trainer.global_step - 1) % self.demo_every != 0 or self.last_demo_step == trainer.global_step:
+        if trainer.global_step % self.demo_every != 0:
             return
-
         module.eval()
 
         print(f"Generating demo")
-        self.last_demo_step = trainer.global_step
 
         demo_samples = self.demo_samples
 
@@ -644,13 +635,13 @@ class DiffusionCondDemoCallback(pl.Callback):
         if module.diffusion.pretransform is not None:
             demo_samples = demo_samples // module.diffusion.pretransform.downsampling_ratio
 
-        noise = torch.randn([self.num_demos, module.diffusion.io_channels, demo_samples]).to(module.device)
+        noise = torch.randn([self.num_demos, module.diffusion.io_channels, demo_samples],dtype=module.dtype).to(module.device)
 
         try:
-            print("Getting conditioning")
-            with torch.cuda.amp.autocast():
+            print(f"demo_cond: {demo_cond}")
+            with torch.cuda.amp.autocast(dtype=module.dtype):
                 conditioning = module.diffusion.conditioner(demo_cond, module.device)
-
+            print(f"conditioning: {conditioning}")
             cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
 
             if self.display_audio_cond:
@@ -692,7 +683,7 @@ class DiffusionCondDemoCallback(pl.Callback):
 
                 print(f"Generating demo for cfg scale {cfg_scale}")
 
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(dtype=module.dtype):
                     model = module.diffusion_ema.model if module.diffusion_ema is not None else module.diffusion.model
 
                     if module.diffusion_objective == "v":

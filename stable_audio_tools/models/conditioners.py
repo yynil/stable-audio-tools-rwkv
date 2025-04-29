@@ -313,7 +313,6 @@ class T5Conditioner(Conditioner):
                 if model in t5_model_name:
                     dim = self.T5_MODEL_DIMS[model]
                     break
-        print(f"T5 dim: {dim}")
         super().__init__(dim, output_dim, project_out=project_out)
         
         from transformers import T5EncoderModel, AutoTokenizer

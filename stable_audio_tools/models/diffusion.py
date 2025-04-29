@@ -585,8 +585,6 @@ class DiRWrapper(ConditionedDiffusionModel):
         **kwargs
     ):
         super().__init__(supports_cross_attention=True, supports_global_cond=False, supports_input_concat=False)
-        print(kwargs)
-        print(args)
         #{'diffusion_objective': 'v', 'attn_mode': 'chunk', 'hidden_size': 2048, 'hidden_ratio': 4, 'num_hidden_layers': 24, 'head_dim': 64, 'decay_low_rank_dim': 96, 'gate_low_rank_dim': 256, 'a_low_rank_dim': 96, 'v_low_rank_dim': 64, 'hidden_act': 'sqrelu', 'max_position_embeddings': 2048, 'norm_first': True, 'norm_bias': True, 'norm_eps': 1e-05, 'use_cache': True, 'initializer_range': 0.02, 'fuse_norm': False, 'fuse_cross_entropy': True, 'vocab_size': 65536, 'bos_token_id': 1, 'eos_token_id': 2, 'pad_token_id': 0, 'intermediate_size': 8192, 'cond_token_dim': 768, 'global_cond_dim': 1536, 'patch_size': 1}
         config = RWKV7Config(attn_mode=kwargs['attn_mode'], 
                         hidden_size=kwargs['hidden_size'], 

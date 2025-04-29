@@ -801,7 +801,7 @@ class WebDatasetDataLoader():
         
         return sample
 
-def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4, shuffle = True):
+def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4, shuffle = True,rank=0,num_replicas=1):
 
     dataset_type = dataset_config.get("dataset_type", None)
 
@@ -862,8 +862,14 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
                                         random_crop=dataset_config.get("random_crop", True),
                                         force_channels=force_channels
         )
-
-        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(
+            train_set,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle
+        )
+        return torch.utils.data.DataLoader(train_set, batch_size, sampler=train_sampler, 
                                 num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
         
         
