@@ -184,7 +184,7 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
     # print(f"model dtype: {model.model.dtype}")
     # The sampling loop
     for i in trange(steps):
-        with torch.amp.autocast(device_type=x.device.type, dtype=model.model.dtype):
+        with torch.amp.autocast(device_type=x.device.type):
             if cfg_pp:
                 # Get the model output (v, the predicted velocity)
                 v, info = model(x, ts * t[i], return_info=True, **extra_args)
