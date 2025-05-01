@@ -170,7 +170,7 @@ def sample_flow_dpmpp(model, x, steps, sigma_max=1, callback=None, dist_shift=No
 
 
 @torch.no_grad()
-def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False, **extra_args):
+def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False,dtype=torch.float16, **extra_args):
     """Draws samples from a model given starting noise. v-diffusion"""
     ts = x.new_ones([x.shape[0]])
 
@@ -184,7 +184,7 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
     # print(f"model dtype: {model.model.dtype}")
     # The sampling loop
     for i in trange(steps):
-        with torch.amp.autocast(device_type=x.device.type):
+        with torch.amp.autocast(device_type=x.device.type, dtype=dtype):
             if cfg_pp:
                 # Get the model output (v, the predicted velocity)
                 v, info = model(x, ts * t[i], return_info=True, **extra_args)
