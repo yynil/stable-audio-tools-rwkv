@@ -170,7 +170,7 @@ def sample_flow_dpmpp(model, x, steps, sigma_max=1, callback=None, dist_shift=No
 
 
 @torch.no_grad()
-def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False,dtype=torch.float16, **extra_args):
+def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False,dtype=torch.bfloat16, **extra_args):
     """Draws samples from a model given starting noise. v-diffusion"""
     ts = x.new_ones([x.shape[0]])
 
