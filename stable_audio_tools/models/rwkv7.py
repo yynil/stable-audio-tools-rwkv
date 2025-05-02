@@ -6,8 +6,8 @@ from rwkvfla.models.rwkv7.configuration_rwkv7 import RWKV7Config
 from rwkvfla.models.rwkv7.modeling_rwkv7 import RWKV7Attention, RWKV7FeedForward
 from rwkvfla.layers.rwkv7 import LoRA
 from rwkvfla.modules import LayerNorm
-from typing import Optional, Tuple
-from functools import partial
+from typing import Optional, Tuple, Literal
+from functools import partial, reduce
 from rwkvfla.ops.rwkv7.chunk import chunk_rwkv7
 from rwkvfla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from torch.nn import functional as F
@@ -15,6 +15,21 @@ def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
     return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 from einops import rearrange
+try:
+    from flash_attn import flash_attn_func, flash_attn_kvpacked_func
+except ImportError as e:
+    print(e)
+    print('flash_attn not installed, disabling Flash Attention')
+    flash_attn_kvpacked_func = None
+    flash_attn_func = None
+def create_causal_mask(i, j, device):
+    return torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
+
+def or_reduce(masks):
+    head, *body = masks
+    for rest in body:
+        head = head | rest
+    return head
 def convert_to_left_padding(
     context: torch.Tensor,
     context_mask: torch.Tensor
@@ -53,8 +68,318 @@ def convert_to_left_padding(
     
     return left_padded_context, left_padded_mask
 
-class RWKV7CrossAttention(nn.Module):
+class TransformerCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_heads = 64,
+        dim_context = None,
+        causal = False,
+        zero_init_output=True,
+        qk_norm: Literal['l2', 'ln', 'none'] = 'none',
+        natten_kernel_size = None,
+        sliding_window = [-1, -1],
+        feat_scale = False
+    ):
+        super().__init__()
+        self.dim = dim
+        self.dim_heads = dim_heads
+        self.causal = causal
 
+        dim_kv = dim_context if dim_context is not None else dim
+        
+        self.num_heads = dim // dim_heads
+        self.kv_heads = dim_kv // dim_heads
+
+        if dim_context is not None:
+            self.to_q = nn.Linear(dim, dim, bias=False)
+            self.to_kv = nn.Linear(dim_kv, dim_kv * 2, bias=False)
+        else:
+            self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+
+        self.to_out = nn.Linear(dim, dim, bias=False)
+
+        if zero_init_output:
+            nn.init.zeros_(self.to_out.weight)
+
+        if qk_norm not in ['l2', 'ln', 'none']:
+            raise ValueError(f'qk_norm must be one of ["l2", "ln", "none"], got {qk_norm}')
+            
+        self.qk_norm = qk_norm
+
+        if self.qk_norm == "ln":
+            self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+            self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+
+        # Using 1d neighborhood attention
+        self.natten_kernel_size = natten_kernel_size
+        if natten_kernel_size is not None:
+            return
+
+        self.use_pt_flash = torch.cuda.is_available() 
+        self.use_fa_flash = torch.cuda.is_available() and flash_attn_func is not None
+
+        self.sdp_kwargs = dict(
+            enable_flash = True,
+            enable_math = True,
+            enable_mem_efficient = True
+        )
+
+        self.sliding_window = sliding_window
+        if not (sliding_window[0] == -1 and sliding_window[1] == -1)  and not self.use_fa_flash:
+            print('Sliding window is being used, but Flash Attention is not. Please install Flash Attention to get correct results')
+
+        self.feat_scale = feat_scale
+
+        if self.feat_scale:
+            self.lambda_dc = nn.Parameter(torch.zeros(dim))
+            self.lambda_hf = nn.Parameter(torch.zeros(dim))
+
+    def flash_attn(
+            self,
+            q, 
+            k, 
+            v,
+            mask = None,
+            causal = None
+    ):
+        batch, heads, q_len, _, k_len, device = *q.shape, k.shape[-2], q.device
+        kv_heads = k.shape[1]
+        # Recommended for multi-query single-key-value attention by Tri Dao
+        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
+        # print(f'q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}, heads: {heads}, kv_heads: {kv_heads}')
+        if heads != kv_heads:
+            # Repeat interleave kv_heads to match q_heads
+            heads_per_kv_head = heads // kv_heads
+            k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+            # print(f'after repeat interleave: k.shape: {k.shape}, v.shape: {v.shape}')
+        if k.ndim == 3:
+            k = rearrange(k, 'b ... -> b 1 ...').expand_as(q)
+
+        if v.ndim == 3:
+            v = rearrange(v, 'b ... -> b 1 ...').expand_as(q)
+
+        causal = self.causal if causal is None else causal
+
+        if q_len == 1 and causal:
+            causal = False
+        
+        if mask is not None:
+            assert mask.ndim == 4
+            mask = mask.expand(batch, heads, q_len, k_len)
+
+        # handle kv cache - this should be bypassable in updated flash attention 2
+
+        if k_len > q_len and causal:
+            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
+            if mask is None:
+                mask = ~causal_mask
+            else:
+                mask = mask & ~causal_mask
+            causal = False
+
+        # manually handle causal mask, if another mask was given
+
+        row_is_entirely_masked = None
+
+        if mask is not None and causal:
+            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
+            mask = mask & ~causal_mask
+
+            # protect against an entire row being masked out
+
+            row_is_entirely_masked = ~mask.any(dim = -1)
+            mask[..., 0] = mask[..., 0] | row_is_entirely_masked
+
+            causal = False
+        
+        #with torch.backends.cuda.sdp_kernel(**self.sdp_kwargs):
+        # print(f'q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}')
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask = mask,
+            is_causal = causal
+        )
+
+        # for a row that is entirely masked out, should zero out the output of that row token
+
+        if row_is_entirely_masked is not None:
+            out = out.masked_fill(row_is_entirely_masked[..., None], 0.)
+
+        return out
+
+    def apply_qk_layernorm(self, q, k):
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        return q, k
+
+    def forward(
+        self,
+        x,
+        context = None,
+        mask = None,
+        context_mask = None,
+        rotary_pos_emb = None,
+        causal = None
+    ):
+        h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
+
+        kv_input = context if has_context else x
+
+        if hasattr(self, 'to_q'):
+            # Use separate linear projections for q and k/v
+            q = self.to_q(x)
+            q = rearrange(q, 'b n (h d) -> b h n d', h = h)
+
+            k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+            # print(f'k.shape: {k.shape}, v.shape: {v.shape}')
+            # print(f'kv_input.shape: {kv_input.shape}')
+            # print(f'q.shape: {q.shape}')
+            # print(f'h: {h}, kv_h: {kv_h}')
+            k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, v))
+        else:
+            # Use fused linear projection
+            q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+        
+        # Normalize q and k for cosine sim attention
+        if self.qk_norm == "l2":
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+        elif self.qk_norm == "ln":
+            q, k = self.apply_qk_layernorm(q, k)
+
+        if rotary_pos_emb is not None and not has_context:
+            freqs, _ = rotary_pos_emb
+
+            q_dtype = q.dtype
+            k_dtype = k.dtype
+
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
+            freqs = freqs.to(torch.float32)
+
+            q = apply_rotary_pos_emb(q, freqs)
+            k = apply_rotary_pos_emb(k, freqs)
+
+            q = q.to(q_dtype)
+            k = k.to(k_dtype)
+        
+        input_mask = context_mask 
+
+        if input_mask is None and not has_context:
+            input_mask = mask
+
+        # determine masking
+        masks = []
+        final_attn_mask = None # The mask that will be applied to the attention matrix, taking all masks into account
+
+        if input_mask is not None:
+            input_mask = rearrange(input_mask, 'b j -> b 1 1 j')
+            masks.append(~input_mask)
+
+        # Other masks will be added here later
+
+        if len(masks) > 0:
+            final_attn_mask = ~or_reduce(masks)
+
+        n, device = q.shape[-2], q.device
+
+        causal = self.causal if causal is None else causal
+
+        if n == 1 and causal:
+            causal = False
+
+        if self.natten_kernel_size is not None:
+            if natten is None:
+                raise ImportError('natten not installed, please install natten to use neighborhood attention')
+            
+            dtype_in = q.dtype
+            q, k, v = map(lambda t: t.to(torch.float32), (q, k, v))
+
+            attn = natten.functional.na1d_qk(q, k, kernel_size = self.natten_kernel_size, dilation=1)
+
+            if final_attn_mask is not None:
+                attn = attn.masked_fill(final_attn_mask, -torch.finfo(attn.dtype).max)
+
+            attn = F.softmax(attn, dim=-1, dtype=torch.float32)
+
+            out = natten.functional.na1d_av(attn, v, kernel_size = self.natten_kernel_size, dilation=1).to(dtype_in)
+
+        # Prioritize Flash Attention 2
+        elif self.use_fa_flash:
+            assert final_attn_mask is None, 'masking not yet supported for Flash Attention 2'
+            # Flash Attention 2 requires FP16 inputs
+            fa_dtype_in = q.dtype
+
+            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
+
+            if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
+                q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
+            
+            out = flash_attn_func(q, k, v, causal = causal, window_size=self.sliding_window)
+            
+            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+
+        # Fall back to PyTorch implementation
+        elif self.use_pt_flash:
+            out = self.flash_attn(q, k, v, causal = causal, mask = final_attn_mask)
+
+        else:
+            # Fall back to custom implementation
+
+            if h != kv_h:
+                # Repeat interleave kv_heads to match q_heads
+                heads_per_kv_head = h // kv_h
+                k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+
+            scale = 1. / (q.shape[-1] ** 0.5)
+
+            kv_einsum_eq = 'b j d' if k.ndim == 3 else 'b h j d'
+
+            dots = einsum(f'b h i d, {kv_einsum_eq} -> b h i j', q, k) * scale
+            
+            i, j, dtype = *dots.shape[-2:], dots.dtype
+
+            mask_value = -torch.finfo(dots.dtype).max
+
+            if final_attn_mask is not None:
+                dots = dots.masked_fill(~final_attn_mask, mask_value)
+
+            if causal:
+                causal_mask = self.create_causal_mask(i, j, device = device)
+                dots = dots.masked_fill(causal_mask, mask_value)
+
+            attn = F.softmax(dots, dim=-1, dtype=torch.float32)
+            attn = attn.type(dtype)
+
+            out = einsum(f'b h i j, {kv_einsum_eq} -> b h i d', attn, v)
+
+        # merge heads
+        out = rearrange(out, ' b h n d -> b n (h d)')
+
+        # Communicate between heads
+        
+        # with autocast(enabled = False):
+        #     out_dtype = out.dtype
+        #     out = out.to(torch.float32)
+        #     out = self.to_out(out).to(out_dtype)
+        out = self.to_out(out)
+
+        if self.feat_scale:
+            out_dc = out.mean(dim=-2, keepdim=True)
+            out_hf = out - out_dc
+
+            # Selectively modulate DC and high frequency components
+            out = out + self.lambda_dc * out_dc + self.lambda_hf * out_hf
+
+        if mask is not None:
+            mask = rearrange(mask, 'b n -> b n 1')
+            out = out.masked_fill(~mask, 0.)
+
+        return out
+
+class RWKV7CrossAttention(nn.Module):
     def __init__(
         self,
         mode: str = 'chunk',
@@ -110,7 +435,7 @@ class RWKV7CrossAttention(nn.Module):
         self.k_a = nn.Parameter(torch.zeros(self.key_dim))
         self.r_k = nn.Parameter(torch.zeros(self.num_heads, self.head_dim))
 
-        if query_dim == None:
+        if query_dim is None:
             query_dim = hidden_size
         self.r_proj = nn.Linear(query_dim, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -154,13 +479,15 @@ class RWKV7CrossAttention(nn.Module):
 
     def forward(
         self,
-        query: torch.Tensor,
+        query: torch.Tensor,  # 必须传入 query
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         v_first: torch.Tensor = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         if attention_mask is not None:
@@ -272,6 +599,7 @@ class RWKV7CrossAttention(nn.Module):
         o = self.o_proj(o * g)
 
         return o, None, past_key_values, v_first
+
 class RWKV7Block(nn.Module):
     def __init__(
         self,
@@ -281,12 +609,14 @@ class RWKV7Block(nn.Module):
         cross_attend: bool = False,
         dim_context: Optional[int] = None,
         layer_scale: bool = False,
+        cross_attn_mode: Literal['transformer', 'rwkv'] = 'transformer',
     ) -> RWKV7Block:
         super().__init__()
 
         self.config = config
         self.layer_idx = layer_idx
         self.cross_attend = cross_attend
+        self.cross_attn_mode = cross_attn_mode
 
         if config.norm_first and layer_idx == 0:
             self.pre_norm = LayerNorm(
@@ -351,22 +681,32 @@ class RWKV7Block(nn.Module):
                 bias=config.norm_bias,
                 eps=config.norm_eps
             )
-            self.cross_attn = RWKV7CrossAttention(
-                mode=config.attn_mode,
-                hidden_size=config.hidden_size,
-                head_dim=config.head_dim,
-                num_heads=config.num_heads,
-                decay_low_rank_dim=config.decay_low_rank_dim,
-                gate_low_rank_dim=config.gate_low_rank_dim,
-                a_low_rank_dim=config.a_low_rank_dim,
-                v_low_rank_dim=config.v_low_rank_dim,
-                norm_eps=config.norm_eps,
-                fuse_norm=config.fuse_norm,
-                layer_idx=layer_idx,
-                value_dim=config.value_dim[layer_idx],
-                num_hidden_layers=config.num_hidden_layers,
-                query_dim=dim_context
-            )
+            if cross_attn_mode == 'transformer':
+                self.cross_attn = TransformerCrossAttention(
+                    dim=config.hidden_size,
+                    dim_context=dim_context,
+                    dim_heads=config.head_dim,
+                    causal=False,
+                    zero_init_output=True,
+                    qk_norm='none'
+                )
+            else:
+                self.cross_attn = RWKV7CrossAttention(
+                    mode=config.attn_mode,
+                    hidden_size=config.hidden_size,
+                    head_dim=config.head_dim,
+                    num_heads=config.num_heads,
+                    decay_low_rank_dim=config.decay_low_rank_dim,
+                    gate_low_rank_dim=config.gate_low_rank_dim,
+                    a_low_rank_dim=config.a_low_rank_dim,
+                    v_low_rank_dim=config.v_low_rank_dim,
+                    norm_eps=config.norm_eps,
+                    fuse_norm=config.fuse_norm,
+                    layer_idx=layer_idx,
+                    value_dim=config.value_dim[layer_idx],
+                    num_hidden_layers=config.num_hidden_layers,
+                    query_dim=dim_context
+                )
             self.cross_attn_scale = LayerScale(config.hidden_size) if layer_scale else nn.Identity()
         else:
             self.cross_attn_scale = nn.Identity()
@@ -380,8 +720,8 @@ class RWKV7Block(nn.Module):
         output_attentions: Optional[bool] = False,
         v_first: torch.Tensor = None,
         global_cond: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,  # 添加 context 参数
+        context_mask: Optional[torch.Tensor] = None,  # 添加 context_mask 参数
         v_cross_attn: Optional[torch.Tensor] = None,
         cross_past_key_values: Optional[Cache] = None,
         **kwargs,
@@ -437,32 +777,28 @@ class RWKV7Block(nn.Module):
 
         # 添加交叉注意力处理
         if self.cross_attend and context is not None:
-            context, context_mask = convert_to_left_padding(context, context_mask)
-            cross_hidden_states,_,cross_past_key_values,v_cross_attn = self.cross_attn(
-                query=context,
-                hidden_states=self.cross_attend_norm(hidden_states),
-                attention_mask=attention_mask,
-                past_key_values=cross_past_key_values,
-                use_cache=False,
-                output_attentions=False,
-                v_first=v_cross_attn,
-                context_mask=context_mask,
-                **kwargs
-            )
-            hidden_states = hidden_states + self.cross_attn_scale(cross_hidden_states)  
-            # hidden_states = hidden_states + self.cross_attn_scale(
-            #     self.cross_attn(
-            #         self.cross_attend_norm(hidden_states),
-            #         attention_mask=attention_mask,
-            #         past_key_values=past_key_values,
-            #         use_cache=use_cache,
-            #         output_attentions=output_attentions,
-            #         v_first=v_cross_attn,
-            #         context=context,
-            #         context_mask=context_mask,
-            #         **kwargs
-            #     )[0]
-            # )
+            if self.cross_attn_mode == 'rwkv':
+                context, context_mask = convert_to_left_padding(context, context_mask)
+                cross_hidden_states,_,cross_past_key_values,v_cross_attn = self.cross_attn(
+                    query=context,
+                    hidden_states=self.cross_attend_norm(hidden_states),
+                    attention_mask=attention_mask,
+                    past_key_values=cross_past_key_values,
+                    use_cache=False,
+                    output_attentions=False,
+                    v_first=v_cross_attn,
+                    context_mask=context_mask,
+                    **kwargs
+                )   
+            else:  # transformer mode
+                cross_hidden_states = self.cross_attn(
+                    x=self.cross_attend_norm(hidden_states),
+                    context=context,
+                    mask=attention_mask,
+                    context_mask=context_mask,
+                    **kwargs
+                )
+            hidden_states = hidden_states + self.cross_attn_scale(cross_hidden_states)
 
         outputs = (hidden_states, attentions, past_key_values, v_first,v_cross_attn,cross_past_key_values)
         return outputs
