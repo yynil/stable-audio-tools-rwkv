@@ -308,7 +308,7 @@ class TransformerCrossAttention(nn.Module):
 
         # Prioritize Flash Attention 2
         elif self.use_fa_flash:
-            assert final_attn_mask is None, 'masking not yet supported for Flash Attention 2'
+            # assert final_attn_mask is None, 'masking not yet supported for Flash Attention 2'
             # Flash Attention 2 requires FP16 inputs
             fa_dtype_in = q.dtype
 
@@ -747,7 +747,6 @@ class RWKV7Block(nn.Module):
                 **kwargs
             )
             hidden_states = hidden_states * torch.sigmoid(1 - gate_self)
-            
             # 应用 feedforward
             hidden_states = self.ffn_norm(hidden_states)
             hidden_states = hidden_states * (1 + scale_ff) + shift_ff
@@ -840,7 +839,8 @@ class ContinuousRWKV(nn.Module):
                 dim_context=cond_token_dim
             ) for i in range(self.depth)
         ])
-
+        for block in self.layers:
+            block.ffn = torch.compile(block.ffn)
         # 全局条件处理
         self.global_cond_embedder = None
         if global_cond_dim is not None:
@@ -937,6 +937,14 @@ class ContinuousRWKV(nn.Module):
         v_first = None
         v_cross_attn = None
         cross_past_key_values = None
+        #pad hidden_states to 16x
+        # b,t,h = context.shape
+        # if t % 16 != 0:
+        #     print(f'before padding context shape is {context.shape},context_mask shape is {context_mask.shape}')
+        #     padded_t = t + (16 - t % 16)
+        #     context = F.pad(context, (0,0,0,padded_t-t))
+        #     context_mask = F.pad(context_mask, (0,padded_t-t))
+        #     print(f'after padding context shape is {context.shape},context_mask shape is {context_mask.shape}')
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 hidden_states, _, past_key_values, v_first,v_cross_attn,cross_past_key_values = checkpoint(

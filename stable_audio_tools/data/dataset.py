@@ -12,6 +12,7 @@ import torch
 import torchaudio
 import webdataset as wds
 import datasets
+import tarfile
 
 from os import path
 from torch import nn
@@ -872,7 +873,23 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
         return torch.utils.data.DataLoader(train_set, batch_size, sampler=train_sampler, 
                                 num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
         
-        
+    elif dataset_type == "tar":
+        tar_paths = dataset_config.get("datasets", None)
+        assert tar_paths is not None, "Tar paths must be specified in datasets[\"dataset\"]"
+        train_set = TarSampleDataset(tar_paths,
+                                        sample_size=sample_size,
+                                        sample_rate=sample_rate,
+                                        random_crop=dataset_config.get("random_crop", True),
+                                        force_channels=force_channels)
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(
+            train_set,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle
+        )
+        return torch.utils.data.DataLoader(train_set, batch_size, sampler=train_sampler, 
+                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
     elif dataset_type == "pre_encoded":
 
         pre_encoded_dir_configs = dataset_config.get("datasets", None)
@@ -1072,3 +1089,80 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f'Error loading sample {idx}: {e}')
             return self[random.randrange(len(self))]
+
+class TarSampleDataset(torch.utils.data.Dataset):
+    def __init__(
+        self, 
+        tar_paths,
+        sample_size=65536, 
+        sample_rate=48000, 
+        random_crop=True,
+        force_channels="stereo"
+    ):
+        super().__init__()
+        
+        self.sample_size = sample_size
+        self.sr = sample_rate
+        self.random_crop = random_crop
+        self.force_channels = force_channels
+        
+        # 初始化音频处理组件
+        self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
+        self.augs = torch.nn.Sequential(
+            PhaseFlipper()
+        )
+        self.encoding = torch.nn.Sequential(
+            Stereo() if force_channels == "stereo" else torch.nn.Identity(),
+            Mono() if force_channels == "mono" else torch.nn.Identity(),
+        )
+        
+        self.dataset = datasets.load_dataset("webdataset", data_dir=tar_paths,split="train")
+        print(f'Total: Found {len(self.dataset)} ')
+        print(self.dataset)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        try:
+            start_time = time.time()
+            sample = self.dataset[idx]
+            mp3_audio = sample['audio.mp3']['array']
+            sampling_rate = sample['audio.mp3']['sampling_rate']
+            path = sample['audio.mp3']['path']
+            json_data = sample['metadata.json']
+            audio, in_sr = torch.from_numpy(mp3_audio).float(), sampling_rate
+            if len(audio.shape) == 1:
+                audio = audio.unsqueeze(0)  # 确保是 [channels, samples] 格式
+            if in_sr != self.sr:
+                resample_tf = T.Resample(in_sr, self.sr)
+                audio = resample_tf(audio)
+
+            audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
+            # 检查静音
+            if is_silence(audio):
+                return self[random.randrange(len(self))]
+            # 应用增强
+            if self.augs is not None:
+                audio = self.augs(audio)
+            audio = audio.clamp(-1, 1)
+            # 应用通道转换
+            if self.encoding is not None:
+                audio = self.encoding(audio)
+            # 构建元数据
+            info = {}
+            info["path"] = path
+            info["timestamps"] = (t_start, t_end)
+            info["seconds_start"] = seconds_start
+            info["seconds_total"] = seconds_total
+            info["padding_mask"] = padding_mask
+            info["sample_rate"] = self.sr
+            # 使用 caption 作为 prompt
+            info["prompt"] = json_data.get('caption', '')
+            end_time = time.time()
+            info["load_time"] = end_time - start_time
+            return (audio, info)
+        except Exception as e:
+            print(f'Error loading sample {idx}: {e}')
+            return self[random.randrange(len(self))]
+

@@ -1,9 +1,10 @@
 from pytorch_lightning.loggers import WandbLogger, CometLogger
-from ..interface.aeiou import pca_point_cloud
+from ..interface.aeiou import pca_point_cloud, audio_spectrogram_image
 
 import wandb
 import torch
 import os
+import torchaudio
 
 def get_rank():
     """Get rank of current process."""
@@ -146,3 +147,23 @@ def log_point_cloud(logger, key, tokens, caption=None):
     elif isinstance(logger, CometLogger):
         point_cloud = pca_point_cloud(tokens, rgb_float=True, output_type="points")
         #logger.experiment.log_points_3d(scene_name=key, points=point_cloud)
+
+def log_audio_and_melspectrum(audio_data, filename, sample_rate,step, key_prefix="", caption=None):
+    """记录音频和梅尔频谱图到 wandb
+    
+    Args:
+        audio_data (torch.Tensor): 音频数据
+        filename (str): 保存音频的文件名
+        sample_rate (int): 采样率
+        key_prefix (str): wandb 记录时的键前缀
+        caption (str): 音频的标题
+    """
+    # 保存音频文件
+    audio_data = audio_data.to(torch.float32).div(torch.max(torch.abs(audio_data))).mul(32767).to(torch.int16).cpu()
+    torchaudio.save(filename, audio_data, sample_rate)
+    print(f'save audio to {filename}')
+    # 记录到 wandb
+    wandb.log({
+        f"{key_prefix}audio": wandb.Audio(filename, sample_rate=sample_rate, caption=caption),
+        f"{key_prefix}melspec": wandb.Image(audio_spectrogram_image(audio_data))
+    })
