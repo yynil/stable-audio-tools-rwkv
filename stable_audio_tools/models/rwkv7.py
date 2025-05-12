@@ -15,6 +15,10 @@ def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
     return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 from einops import rearrange
+import logging
+import os
+logger = logging.getLogger(__name__)
+logger.setLevel(level=logging.DEBUG if os.environ.get("DEBUG", "false").lower() == "true" else logging.WARNING)
 try:
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
@@ -750,6 +754,7 @@ class RWKV7Block(nn.Module):
             # 应用 feedforward
             hidden_states = self.ffn_norm(hidden_states)
             hidden_states = hidden_states * (1 + scale_ff) + shift_ff
+            # print(f'Global cond hidden_states shape is {hidden_states.shape}')
             hidden_states, past_key_values = self.ffn(hidden_states, attention_mask, past_key_values)
             hidden_states = hidden_states * torch.sigmoid(1 - gate_ff)
         else:
@@ -771,6 +776,7 @@ class RWKV7Block(nn.Module):
                 hidden_states = residual + hidden_states
                 residual = hidden_states
                 hidden_states = self.ffn_norm(hidden_states)
+            # print(f'NO cond hidden_states shape is {hidden_states.shape}')
             hidden_states, past_key_values = self.ffn(hidden_states, attention_mask, past_key_values)
             hidden_states = residual + hidden_states
 
@@ -839,8 +845,8 @@ class ContinuousRWKV(nn.Module):
                 dim_context=cond_token_dim
             ) for i in range(self.depth)
         ])
-        for block in self.layers:
-            block.ffn = torch.compile(block.ffn)
+        # for block in self.layers:
+        #     block.ffn = torch.compile(block.ffn)
         # 全局条件处理
         self.global_cond_embedder = None
         if global_cond_dim is not None:
@@ -945,6 +951,20 @@ class ContinuousRWKV(nn.Module):
         #     context = F.pad(context, (0,0,0,padded_t-t))
         #     context_mask = F.pad(context_mask, (0,padded_t-t))
         #     print(f'after padding context shape is {context.shape},context_mask shape is {context_mask.shape}')
+        logger.debug(f'global_cond shape: {global_cond.shape}')
+        logger.debug(f'context shape: {context.shape}')
+        logger.debug(f'hidden_states shape: {hidden_states.shape}')
+        b,t,h = hidden_states.shape
+        padded_hidden_length = 0
+        if t % 16 != 0:
+            logger.debug(f'before padding hidden_states shape is {hidden_states.shape}')
+            padded_hidden_length = 16 - t % 16
+            # 对 hidden_states 进行左填充
+            hidden_states = F.pad(hidden_states, (0, 0, padded_hidden_length, 0))
+            # 对 mask 进行左填充，填充值为 0
+            if mask is not None:
+                mask = F.pad(mask, (padded_hidden_length, 0), value=0)
+            logger.debug(f'after padding hidden_states shape is {hidden_states.shape}')
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 hidden_states, _, past_key_values, v_first,v_cross_attn,cross_past_key_values = checkpoint(
@@ -980,7 +1000,12 @@ class ContinuousRWKV(nn.Module):
             
             if return_info:
                 info["hidden_states"].append(hidden_states)
-
+        if padded_hidden_length != 0:
+            logger.debug(f'stripping hidden_states {hidden_states.shape}')
+            hidden_states = hidden_states[:, padded_hidden_length:, :]
+            if mask is not None:
+                mask = mask[:, padded_hidden_length:]
+            logger.debug(f'stripped hidden_states {hidden_states.shape}')
         # 输出投影
         hidden_states = self.project_out(hidden_states)
 

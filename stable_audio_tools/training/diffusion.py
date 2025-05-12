@@ -360,6 +360,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         #with torch.amp.autocast(device_type="cuda"):
         conditioning = self.diffusion.conditioner(metadata, self.device)
+        # print(f'conditioning: {conditioning}')
         # print(f'conditioning prompt: {conditioning["prompt"][0].dtype}')
         # If mask_padding is on, randomly drop the padding masks to allow for learning silence padding
         use_padding_mask = self.mask_padding and random.random() > self.mask_padding_dropout

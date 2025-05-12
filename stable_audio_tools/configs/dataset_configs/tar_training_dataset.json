@@ -1,0 +1,8 @@
+{
+    "dataset_type": "tar",
+    "datasets": "/data/training/laion-300M-sampling/",
+    "random_crop": true,
+    "drop_last": true,
+    "sample_size": 480000,
+    "sample_rate": 16000
+}

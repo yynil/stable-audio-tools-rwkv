@@ -1023,22 +1023,46 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
             Mono() if force_channels == "mono" else torch.nn.Identity(),
         )
         
+        self.required_features = ['audio','title','album_title','artist','description','tags']
+        self.length = 0
         # 加载 parquet 数据
         if isinstance(parquet_paths, str) and os.path.isdir(parquet_paths):
-            self.parquet_paths = [os.path.join(parquet_paths, f) for f in os.listdir(parquet_paths) if f.endswith('.parquet')]
+            parquet_paths = [os.path.join(parquet_paths, f) for f in os.listdir(parquet_paths) if f.endswith('.parquet')]
+            self.dataset = [datasets.load_dataset('parquet', data_files=parquet_paths,num_proc=16)['train']]
+            
         else:
-            self.parquet_paths = parquet_paths if isinstance(parquet_paths, list) else [parquet_paths]
-        self.dataset = datasets.load_dataset('parquet', data_files=self.parquet_paths)['train']
-        
-        print(f'Loaded {len(self.dataset)} samples from parquet files')
+            # 确保 parquet_paths 是列表
+            if isinstance(parquet_paths, str):
+                parquet_paths = [parquet_paths]
+                
+            self.dataset = []
+            for parquet_path in parquet_paths:
+                print(f'Loading parquet file: {parquet_path}')
+                parquet_files = [os.path.join(parquet_path, f) for f in os.listdir(parquet_path) if f.endswith('.parquet')]
+                dataset = datasets.load_dataset('parquet', data_files=parquet_files,num_proc=16)['train']
+                self.dataset.append(dataset)
+        index = 0
+        self.indices = [ ]
+        for ds in self.dataset:
+            index += len(ds)
+            self.indices.append(index)
+            self.length += len(ds)
+        print(f'Loaded {self.length} samples from parquet files, indices: {self.indices}')
+
 
     def __len__(self):
-        return len(self.dataset)
+        return self.length
 
     def __getitem__(self, idx):
         try:
+            #find the index of the  dataset
+
+            for i, index in enumerate(self.indices):
+                if idx < index:
+                    break
+            idx = idx - index
             start_time = time.time()
-            sample = self.dataset[idx]
+            sample = self.dataset[i][idx]
             
             # 加载音频数据
             audio_data = sample['audio']['array']
@@ -1068,6 +1092,9 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
             if self.encoding is not None:
                 audio = self.encoding(audio)
             
+            title = sample['title'] if 'title' in sample else ''
+            album_title = sample['album_title'] if 'album_title' in sample else ''
+            artist = sample['artist'] if 'artist' in sample else ''
             # 构建元数据
             info = {}
             info["path"] = sample['audio']['path']
@@ -1080,7 +1107,7 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
             # 构建 prompt
             description = sample.get('description', '')
             tags = sample.get('tags', [])
-            info["prompt"] = description.strip() + ' ' + ' '.join(tags)
+            info["prompt"] = (description.strip() + ' ' + ' '.join(tags)+' '+title+' '+album_title+' '+artist).strip()
             
             end_time = time.time()
             info["load_time"] = end_time - start_time
@@ -1088,7 +1115,9 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
             return (audio, info)
         except Exception as e:
             print(f'Error loading sample {idx}: {e}')
-            return self[random.randrange(len(self))]
+            import traceback
+            traceback.print_exc()   
+            return None
 
 class TarSampleDataset(torch.utils.data.Dataset):
     def __init__(

@@ -613,12 +613,14 @@ class DiRWrapper(ConditionedDiffusionModel):
         patch_size=kwargs['patch_size']
         io_channels=kwargs['io_channels']
         project_cond_tokens=kwargs['project_cond_tokens']
+        global_cond_type=kwargs['global_cond_type']
         self.model = DiffusionRWKV7(config, 
                                     io_channels=io_channels, 
                                     project_cond_tokens=project_cond_tokens, 
                                     patch_size=patch_size,
                                     cond_token_dim=cond_token_dim,
-                                    global_cond_dim=global_cond_dim)
+                                    global_cond_dim=global_cond_dim,
+                                    global_cond_type=global_cond_type)
 
         with torch.no_grad():
             for param in self.model.parameters():

@@ -102,7 +102,7 @@ class DiffusionRWKV7(nn.Module):
         global_dim = None
         if self.global_cond_type == "adaLN":
             global_dim = config.hidden_size
-            
+        
         self.rwkv = ContinuousRWKV(
             config,
             dim_in=dim_in * patch_size,
@@ -137,7 +137,7 @@ class DiffusionRWKV7(nn.Module):
         return_info: bool = False,
         **kwargs
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
-        logger.info(f"x: {x.shape}")
+        # print(f"x: {x.shape}")
         # 处理交叉注意力条件
         if cross_attn_cond is not None:
             cross_attn_cond = self.to_cond_embed(cross_attn_cond)
@@ -194,18 +194,19 @@ class DiffusionRWKV7(nn.Module):
         extra_args = {}
         if self.global_cond_type == "adaLN":
             extra_args["global_cond"] = global_embed
+        else:
+            extra_args["global_cond"] = None
             
         if self.patch_size > 1:
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
-            
-        logger.debug(f"x: {x.shape} before rwkv")
+        # print(f'global_embed: {global_embed.shape}')
+        # print(f"x: {x.shape} before rwkv")
             
         x = self.rwkv(
             x,
             mask=mask,
             prepend_embeds=prepend_inputs,
             prepend_mask=prepend_mask,
-            global_cond=global_embed if self.global_cond_type == "adaLN" else None,
             return_info=return_info,
             context=cross_attn_cond,
             context_mask=cross_attn_cond_mask,

@@ -79,7 +79,9 @@ def main():
 
     with open(args.dataset_config) as f:
         dataset_config = json.load(f)
-
+    print(f'model_config: {model_config}')
+    print(f'dataset_config: {dataset_config}')
+    print(f'args.dataset_config: {args.dataset_config}')
     train_dl = create_dataloader_from_config(
         dataset_config,
         batch_size=args.batch_size,
