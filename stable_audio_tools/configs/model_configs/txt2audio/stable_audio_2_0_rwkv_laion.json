@@ -89,7 +89,7 @@
                 "optimizer": {
                     "type": "AdamW",
                     "config": {
-                        "lr": 5e-5,
+                        "lr": 3e-4,
                         "betas": [0.9, 0.999],
                         "weight_decay": 1e-3
                     }
@@ -110,7 +110,7 @@
             "num_demos": 4,
             "demo_cond": [
                 {"prompt": "Amen break 174 BPM", "seconds_start": 0, "seconds_total": 12},
-                {"prompt": "A beautiful orchestral symphony, classical music", "seconds_start": 0, "seconds_total": 20},
+                {"prompt": "motor cycle engine revving in a rainy night", "seconds_start": 0, "seconds_total": 20},
                 {"prompt": "key strokes of a mechanical keyboard", "seconds_start": 0, "seconds_total": 30},
                 {"prompt": "A pop song about love and loss", "seconds_start": 0, "seconds_total": 25}
             ],

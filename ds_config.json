@@ -1,54 +1,38 @@
 {
-    "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": "auto",
-    "gradient_accumulation_steps": "auto",
-    "optimizer": {
-        "type": "Adam",
-        "params": {
-            "lr": "auto",
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
-            "weight_decay": 0.01
-        }
+    "train_batch_size": 4,
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 1,
+    "bf16": {
+        "enabled": true,
+        "loss_scale_window": 1000,
+        "initial_scale_power": 16,
+        "min_loss_scale": 1
     },
-    "scheduler": {
-        "type": "WarmupLR",
-        "params": {
-            "warmup_min_lr": 0,
-            "warmup_max_lr": "auto",
-            "warmup_num_steps": 1000
-        }
+    "fp16": {
+        "enabled": false
     },
     "zero_optimization": {
         "stage": 2,
         "allgather_partitions": true,
-        "allgather_bucket_size": 5e8,
+        "allgather_bucket_size": 5.000000e+08,
         "overlap_comm": true,
         "reduce_scatter": true,
-        "reduce_bucket_size": 5e8,
-        "contiguous_gradients": true
+        "reduce_bucket_size": 5.000000e+08,
+        "contiguous_gradients": true,
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": true,
+            "buffer_count": 4
+        },
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": true,
+            "buffer_count": 5,
+            "buffer_size": 1e9
+        }
     },
     "gradient_clipping": 1.0,
-    "fp16": {
-        "enabled": true,
-        "auto_cast": true,
-        "loss_scale": 0,
-        "initial_scale_power": 16,
-        "loss_scale_window": 1000,
-        "hysteresis": 2,
-        "min_loss_scale": 1
-    },
     "steps_per_print": 10,
     "wall_clock_breakdown": false,
-    "checkpoint": {
-        "tag_validation": false,
-        "load_universal": false,
-        "use_node_local_storage": false,
-        "parallel_write": false,
-        "save_async": false,
-        "save_async_threads": 1,
-        "save_async_retry": 3,
-        "save_async_retry_delay": 1,
-        "save_async_retry_backoff": 1.5
-    }
+    "dump_state": false
 } 

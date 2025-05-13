@@ -248,7 +248,7 @@ def main():
             if global_step % model_config["training"]["demo"]["demo_every"] == 0:
                 if accelerator.is_main_process:
                     accelerator.print(f"生成demo step {global_step}")
-                    demo_callback.on_train_batch_end(None, training_wrapper, None, batch, batch_idx)
+                    demo_callback.on_train_batch_end(None, training_wrapper, None, batch, global_step)
             
             # 检查点保存
             if args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:

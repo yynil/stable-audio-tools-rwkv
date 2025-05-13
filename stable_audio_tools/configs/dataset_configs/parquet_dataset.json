@@ -1,6 +1,6 @@
 {
     "dataset_type": "parquet",
-    "datasets": ["/data/training/freesound-laion-640k/data/","/data/training/free-music-archive-small/data/"],
+    "datasets": ["/data/training/freesound-laion-640k/data/","/data/training/free-music-archive-large/data/"],
     "random_crop": true,
     "drop_last": true
 }

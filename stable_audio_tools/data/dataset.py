@@ -1054,70 +1054,77 @@ class ParquetSampleDataset(torch.utils.data.Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        try:
-            #find the index of the  dataset
-
-            for i, index in enumerate(self.indices):
-                if idx < index:
-                    break
-            idx = idx - index
-            start_time = time.time()
-            sample = self.dataset[i][idx]
-            
-            # 加载音频数据
-            audio_data = sample['audio']['array']
-            audio = torch.from_numpy(audio_data).float()
-            if len(audio.shape) == 1:
-                audio = audio.unsqueeze(0)  # 确保是 [channels, samples] 格式
-            
-            # 重采样
-            if sample['audio']['sampling_rate'] != self.sr:
-                resample_tf = T.Resample(sample['audio']['sampling_rate'], self.sr)
-                audio = resample_tf(audio)
-            
-            # 应用裁剪
-            audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
-            
-            # 检查静音
-            if is_silence(audio):
-                return self[random.randrange(len(self))]
-            
-            # 应用增强
-            if self.augs is not None:
-                audio = self.augs(audio)
-            
-            audio = audio.clamp(-1, 1)
-            
-            # 应用通道转换
-            if self.encoding is not None:
-                audio = self.encoding(audio)
-            
-            title = sample['title'] if 'title' in sample else ''
-            album_title = sample['album_title'] if 'album_title' in sample else ''
-            artist = sample['artist'] if 'artist' in sample else ''
-            # 构建元数据
-            info = {}
-            info["path"] = sample['audio']['path']
-            info["timestamps"] = (t_start, t_end)
-            info["seconds_start"] = seconds_start
-            info["seconds_total"] = seconds_total
-            info["padding_mask"] = padding_mask
-            info["sample_rate"] = self.sr
-            
-            # 构建 prompt
-            description = sample.get('description', '')
-            tags = sample.get('tags', [])
-            info["prompt"] = (description.strip() + ' ' + ' '.join(tags)+' '+title+' '+album_title+' '+artist).strip()
-            
-            end_time = time.time()
-            info["load_time"] = end_time - start_time
-            
-            return (audio, info)
-        except Exception as e:
-            print(f'Error loading sample {idx}: {e}')
-            import traceback
-            traceback.print_exc()   
-            return None
+        max_retries = 10  # 最大重试次数
+        original_idx = idx  # 记录原始索引
+        
+        for retry in range(max_retries):
+            try:
+                #find the index of the  dataset
+                for i, index in enumerate(self.indices):
+                    if idx < index:
+                        break
+                idx = idx - index
+                start_time = time.time()
+                sample = self.dataset[i][idx]
+                
+                # 加载音频数据
+                audio_data = sample['audio']['array']
+                audio = torch.from_numpy(audio_data).float()
+                if len(audio.shape) == 1:
+                    audio = audio.unsqueeze(0)  # 确保是 [channels, samples] 格式
+                
+                # 重采样
+                if sample['audio']['sampling_rate'] != self.sr:
+                    resample_tf = T.Resample(sample['audio']['sampling_rate'], self.sr)
+                    audio = resample_tf(audio)
+                
+                # 应用裁剪
+                audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
+                
+                # 检查静音
+                if is_silence(audio):
+                    idx = random.randrange(len(self))
+                    continue
+                
+                # 应用增强
+                if self.augs is not None:
+                    audio = self.augs(audio)
+                
+                audio = audio.clamp(-1, 1)
+                
+                # 应用通道转换
+                if self.encoding is not None:
+                    audio = self.encoding(audio)
+                
+                title = sample['title'] if 'title' in sample else ''
+                album_title = sample['album_title'] if 'album_title' in sample else ''
+                artist = sample['artist'] if 'artist' in sample else ''
+                # 构建元数据
+                info = {}
+                info["path"] = sample['audio']['path']
+                info["timestamps"] = (t_start, t_end)
+                info["seconds_start"] = seconds_start
+                info["seconds_total"] = seconds_total
+                info["padding_mask"] = padding_mask
+                info["sample_rate"] = self.sr
+                
+                # 构建 prompt
+                description = sample.get('description', '')
+                tags = sample.get('tags', [])
+                info["prompt"] = (description.strip() + ' ' + ' '.join(tags)+' '+title+' '+album_title+' '+artist).strip()
+                
+                end_time = time.time()
+                info["load_time"] = end_time - start_time
+                
+                return (audio, info)
+            except Exception as e:
+                print(f'Error loading sample {original_idx} (retry {retry + 1}/{max_retries}): {e}')
+                import traceback
+                traceback.print_exc()
+                if retry == max_retries - 1:  # 如果是最后一次重试
+                    raise Exception(f"Failed to load sample after {max_retries} retries. Original index: {original_idx}")
+                idx = random.randrange(len(self))  # 随机选择新的索引
+                continue
 
 class TarSampleDataset(torch.utils.data.Dataset):
     def __init__(
