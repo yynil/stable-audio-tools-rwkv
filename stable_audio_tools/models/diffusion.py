@@ -106,7 +106,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             io_channels,
             sample_rate,
             min_input_length: int,
-            diffusion_objective: tp.Literal["v", "rectified_flow"] = "v",
+            diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
             distribution_shift_options = None,
             pretransform: tp.Optional[Pretransform] = None,
             cross_attn_cond_ids: tp.List[str] = [],
@@ -505,10 +505,13 @@ class DiffusionAttnUnet1D(nn.Module):
 class DiTWrapper(ConditionedDiffusionModel):
     def __init__(
         self,
+        diffusion_objective: str,
         *args,
         **kwargs
     ):
         super().__init__(supports_cross_attention=True, supports_global_cond=False, supports_input_concat=False)
+
+        self.diffusion_objective = diffusion_objective
 
         self.model = DiffusionTransformer(*args, **kwargs)
 
@@ -785,13 +788,6 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
 
         extra_kwargs["diffusion_objective"] = diffusion_objective
 
-    elif model_type == "diffusion_prior":
-        prior_type = model_config.get("prior_type", None)
-        assert prior_type is not None, "Must specify prior_type in diffusion prior model config"
-
-        if prior_type == "mono_stereo":
-            from .diffusion_prior import MonoToStereoDiffusionPrior
-            wrapper_fn = MonoToStereoDiffusionPrior
             
     return wrapper_fn(
         diffusion_model,

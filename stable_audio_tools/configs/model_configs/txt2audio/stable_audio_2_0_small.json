@@ -47,7 +47,7 @@
                     "id": "prompt",
                     "type": "t5",
                     "config": {
-                        "t5_model_name": "t5-base",
+                        "t5_model_name": "/external_data/models/t5-base",
                         "max_length": 64
                     }
                 },

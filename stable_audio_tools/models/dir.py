@@ -40,7 +40,7 @@ class DiffusionRWKV7(nn.Module):
         global_cond_type: Literal["prepend", "adaLN"] = "prepend",
         timestep_cond_type: Literal["global", "input_concat"] = "global",
         timestep_embed_dim: Optional[int] = None,
-        diffusion_objective: Literal["v", "rectified_flow"] = "v",
+        diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
         **kwargs
     ):
         super().__init__()
@@ -224,176 +224,209 @@ class DiffusionRWKV7(nn.Module):
             x = rearrange(x, "b (c p) t -> b c (t p)", p=self.patch_size)
             
         x = self.postprocess_conv(x) + x
-        
+        logger.debug(f'x dtype: {x.dtype} and x shape: {x.shape}')
         if return_info:
             return x, info
-
+        
         return x
         
     def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        cross_attn_cond: Optional[torch.Tensor] = None,
-        cross_attn_cond_mask: Optional[torch.Tensor] = None,
-        negative_cross_attn_cond: Optional[torch.Tensor] = None,
-        negative_cross_attn_mask: Optional[torch.Tensor] = None,
-        input_concat_cond: Optional[torch.Tensor] = None,
-        global_embed: Optional[torch.Tensor] = None,
-        negative_global_embed: Optional[torch.Tensor] = None,
-        prepend_cond: Optional[torch.Tensor] = None,
-        prepend_cond_mask: Optional[torch.Tensor] = None,
-        cfg_scale: float = 1.0,
-        cfg_dropout_prob: float = 0.0,
-        cfg_interval: Tuple[float, float] = (0, 1),
-        causal: bool = False,
-        scale_phi: float = 0.0,
-        mask: Optional[torch.Tensor] = None,
-        return_info: bool = False,
-        **kwargs
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
-        assert not causal, "Causal mode is not supported for DiffusionRWKV7"
-        
-        # 转换数据类型
+        self, 
+        x, 
+        t, 
+        cross_attn_cond=None,
+        cross_attn_cond_mask=None,
+        negative_cross_attn_cond=None,
+        negative_cross_attn_mask=None,
+        input_concat_cond=None,
+        global_embed=None,
+        negative_global_embed=None,
+        prepend_cond=None,
+        prepend_cond_mask=None,
+        cfg_scale=1.0,
+        cfg_dropout_prob=0.0,
+        cfg_interval = (0, 1),
+        causal=False,
+        scale_phi=0.0,
+        mask=None,
+        return_info=False,
+        exit_layer_ix=None,
+        **kwargs):
+        assert causal == False, "Causal mode is not supported for DiffusionTransformer"
+
         model_dtype = next(self.parameters()).dtype
-        x = x.to(model_dtype)
-        t = t.to(model_dtype)
         
+        x = x.to(model_dtype)
+
+        t = t.to(model_dtype)
+
         if cross_attn_cond is not None:
             cross_attn_cond = cross_attn_cond.to(model_dtype)
+
         if negative_cross_attn_cond is not None:
             negative_cross_attn_cond = negative_cross_attn_cond.to(model_dtype)
+
         if input_concat_cond is not None:
             input_concat_cond = input_concat_cond.to(model_dtype)
+
         if global_embed is not None:
             global_embed = global_embed.to(model_dtype)
+
         if negative_global_embed is not None:
             negative_global_embed = negative_global_embed.to(model_dtype)
+
         if prepend_cond is not None:
             prepend_cond = prepend_cond.to(model_dtype)
-            
-        # 处理掩码
+
         if cross_attn_cond_mask is not None:
             cross_attn_cond_mask = cross_attn_cond_mask.bool()
+
+            cross_attn_cond_mask = None # Temporarily disabling conditioning masks due to kernel issue for flash attention
+
         if prepend_cond_mask is not None:
             prepend_cond_mask = prepend_cond_mask.bool()
-            
+
+        # Early exit bypasses CFG processing
+        if exit_layer_ix is not None:
+            assert self.transformer_type == "continuous_transformer", "exit_layer_ix is only supported for continuous_transformer"
+            return self._forward(
+                x,
+                t,
+                cross_attn_cond=cross_attn_cond, 
+                cross_attn_cond_mask=cross_attn_cond_mask, 
+                input_concat_cond=input_concat_cond, 
+                global_embed=global_embed, 
+                prepend_cond=prepend_cond, 
+                prepend_cond_mask=prepend_cond_mask,
+                mask=mask,
+                return_info=return_info,
+                exit_layer_ix=exit_layer_ix,
+                **kwargs
+            )
+
         # CFG dropout
-        if cfg_dropout_prob > 0.0:
+        if cfg_dropout_prob > 0.0 and cfg_scale == 1.0:
             if cross_attn_cond is not None:
                 null_embed = torch.zeros_like(cross_attn_cond, device=cross_attn_cond.device)
                 dropout_mask = torch.bernoulli(torch.full((cross_attn_cond.shape[0], 1, 1), cfg_dropout_prob, device=cross_attn_cond.device)).to(torch.bool)
                 cross_attn_cond = torch.where(dropout_mask, null_embed, cross_attn_cond)
-                
+
             if prepend_cond is not None:
                 null_embed = torch.zeros_like(prepend_cond, device=prepend_cond.device)
                 dropout_mask = torch.bernoulli(torch.full((prepend_cond.shape[0], 1, 1), cfg_dropout_prob, device=prepend_cond.device)).to(torch.bool)
                 prepend_cond = torch.where(dropout_mask, null_embed, prepend_cond)
-                
-        # 获取当前时间步
-        step_t = t[0]
-        
+
         if self.diffusion_objective == "v":
-            sigma = torch.sin(step_t * math.pi / 2)
-        elif self.diffusion_objective == "rectified_flow":
-            sigma = step_t
-            
-        # 处理 CFG
-        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and (cfg_interval[0] <= sigma <= cfg_interval[1]):
-            # 准备批次输入
+            sigma = torch.sin(t * math.pi / 2)
+            alpha = torch.cos(t * math.pi / 2)
+        elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+            sigma = t
+
+        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and (cfg_interval[0] <= sigma[0] <= cfg_interval[1]):
+
+            # Classifier-free guidance
+            # Concatenate conditioned and unconditioned inputs on the batch dimension            
             batch_inputs = torch.cat([x, x], dim=0)
             batch_timestep = torch.cat([t, t], dim=0)
-            
+
             if global_embed is not None:
                 batch_global_cond = torch.cat([global_embed, global_embed], dim=0)
             else:
                 batch_global_cond = None
-                
+
             if input_concat_cond is not None:
                 batch_input_concat_cond = torch.cat([input_concat_cond, input_concat_cond], dim=0)
             else:
                 batch_input_concat_cond = None
-                
-            # 处理交叉注意力条件
+
             batch_cond = None
             batch_cond_masks = None
+            
+            # Handle CFG for cross-attention conditioning
             if cross_attn_cond is not None:
+
                 null_embed = torch.zeros_like(cross_attn_cond, device=cross_attn_cond.device)
+
+                # For negative cross-attention conditioning, replace the null embed with the negative cross-attention conditioning
                 if negative_cross_attn_cond is not None:
+
+                    # If there's a negative cross-attention mask, set the masked tokens to the null embed
                     if negative_cross_attn_mask is not None:
                         negative_cross_attn_mask = negative_cross_attn_mask.to(torch.bool).unsqueeze(2)
+
                         negative_cross_attn_cond = torch.where(negative_cross_attn_mask, negative_cross_attn_cond, null_embed)
+                    
                     batch_cond = torch.cat([cross_attn_cond, negative_cross_attn_cond], dim=0)
+
                 else:
                     batch_cond = torch.cat([cross_attn_cond, null_embed], dim=0)
-                    
+
                 if cross_attn_cond_mask is not None:
                     batch_cond_masks = torch.cat([cross_attn_cond_mask, cross_attn_cond_mask], dim=0)
-                    
-            # 处理前置条件
+               
             batch_prepend_cond = None
             batch_prepend_cond_mask = None
+
             if prepend_cond is not None:
+
                 null_embed = torch.zeros_like(prepend_cond, device=prepend_cond.device)
+
                 batch_prepend_cond = torch.cat([prepend_cond, null_embed], dim=0)
+                           
                 if prepend_cond_mask is not None:
                     batch_prepend_cond_mask = torch.cat([prepend_cond_mask, prepend_cond_mask], dim=0)
-                    
-            # 处理掩码
+         
+
             if mask is not None:
                 batch_masks = torch.cat([mask, mask], dim=0)
             else:
                 batch_masks = None
-                
-            # 前向传播
-            batch_output = self._forward(
-                batch_inputs,
-                batch_timestep,
-                cross_attn_cond=batch_cond,
-                cross_attn_cond_mask=batch_cond_masks,
-                mask=batch_masks,
-                input_concat_cond=batch_input_concat_cond,
-                global_embed=batch_global_cond,
-                prepend_cond=batch_prepend_cond,
-                prepend_cond_mask=batch_prepend_cond_mask,
-                return_info=return_info,
-                **kwargs
-            )
             
+            batch_output = self._forward(
+                batch_inputs, 
+                batch_timestep, 
+                cross_attn_cond=batch_cond, 
+                cross_attn_cond_mask=batch_cond_masks, 
+                mask = batch_masks, 
+                input_concat_cond=batch_input_concat_cond, 
+                global_embed = batch_global_cond,
+                prepend_cond = batch_prepend_cond,
+                prepend_cond_mask = batch_prepend_cond_mask,
+                return_info = return_info,
+                **kwargs)
+
             if return_info:
                 batch_output, info = batch_output
-                
-            # 分离条件和无条件输出
+
             cond_output, uncond_output = torch.chunk(batch_output, 2, dim=0)
-            
-            # 应用 CFG
+
             cfg_output = uncond_output + (cond_output - uncond_output) * cfg_scale
-            
-            # CFG 重缩放
+
+            # CFG Rescale
             if scale_phi != 0.0:
                 cond_out_std = cond_output.std(dim=1, keepdim=True)
                 out_cfg_std = cfg_output.std(dim=1, keepdim=True)
                 output = scale_phi * (cfg_output * (cond_out_std/out_cfg_std)) + (1-scale_phi) * cfg_output
             else:
                 output = cfg_output
-                
+           
             if return_info:
                 info["uncond_output"] = uncond_output
                 return output, info
-                
+
             return output
             
         else:
             return self._forward(
                 x,
                 t,
-                cross_attn_cond=cross_attn_cond,
-                cross_attn_cond_mask=cross_attn_cond_mask,
-                input_concat_cond=input_concat_cond,
-                global_embed=global_embed,
-                prepend_cond=prepend_cond,
+                cross_attn_cond=cross_attn_cond, 
+                cross_attn_cond_mask=cross_attn_cond_mask, 
+                input_concat_cond=input_concat_cond, 
+                global_embed=global_embed, 
+                prepend_cond=prepend_cond, 
                 prepend_cond_mask=prepend_cond_mask,
                 mask=mask,
                 return_info=return_info,
                 **kwargs
-            ) 
+            )

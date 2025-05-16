@@ -689,7 +689,7 @@ class RWKV7Block(nn.Module):
                 self.cross_attn = TransformerCrossAttention(
                     dim=config.hidden_size,
                     dim_context=dim_context,
-                    dim_heads=config.head_dim,
+                    dim_heads=128,
                     causal=False,
                     zero_init_output=True,
                     qk_norm='none'

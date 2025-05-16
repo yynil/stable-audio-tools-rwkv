@@ -1,10 +1,9 @@
 from pytorch_lightning.loggers import WandbLogger, CometLogger
-from ..interface.aeiou import pca_point_cloud, audio_spectrogram_image
+from ..interface.aeiou import pca_point_cloud
 
 import wandb
 import torch
 import os
-import torchaudio
 
 def get_rank():
     """Get rank of current process."""
@@ -32,12 +31,10 @@ class InverseLR(torch.optim.lr_scheduler._LRScheduler):
             Default: 0.
         final_lr (float): The final learning rate. Default: 0.
         last_epoch (int): The index of last epoch. Default: -1.
-        verbose (bool): If ``True``, prints a message to stdout for
-            each update. Default: ``False``.
     """
 
     def __init__(self, optimizer, inv_gamma=1., power=1., warmup=0., final_lr=0.,
-                 last_epoch=-1, verbose=False):
+                 last_epoch=-1):
         self.inv_gamma = inv_gamma
         self.power = power
         if not 0. <= warmup < 1:
@@ -59,23 +56,6 @@ class InverseLR(torch.optim.lr_scheduler._LRScheduler):
         lr_mult = (1 + self.last_epoch / self.inv_gamma) ** -self.power
         return [warmup * max(self.final_lr, base_lr * lr_mult)
                 for base_lr in self.base_lrs]
-
-def copy_state_dict(model, state_dict):
-    """Load state_dict to model, but only for keys that match exactly.
-
-    Args:
-        model (nn.Module): model to load state_dict.
-        state_dict (OrderedDict): state_dict to load.
-    """
-    model_state_dict = model.state_dict()
-    for key in state_dict:
-        if key in model_state_dict and state_dict[key].shape == model_state_dict[key].shape:
-            if isinstance(state_dict[key], torch.nn.Parameter):
-                # backwards compatibility for serialized parameters
-                state_dict[key] = state_dict[key].data
-            model_state_dict[key] = state_dict[key]
-
-    model.load_state_dict(model_state_dict, strict=False)
 
 def create_optimizer_from_config(optimizer_config, parameters):
     """Create optimizer from config.
@@ -147,23 +127,3 @@ def log_point_cloud(logger, key, tokens, caption=None):
     elif isinstance(logger, CometLogger):
         point_cloud = pca_point_cloud(tokens, rgb_float=True, output_type="points")
         #logger.experiment.log_points_3d(scene_name=key, points=point_cloud)
-
-def log_audio_and_melspectrum(audio_data, filename, sample_rate,step, key_prefix="", caption=None):
-    """记录音频和梅尔频谱图到 wandb
-    
-    Args:
-        audio_data (torch.Tensor): 音频数据
-        filename (str): 保存音频的文件名
-        sample_rate (int): 采样率
-        key_prefix (str): wandb 记录时的键前缀
-        caption (str): 音频的标题
-    """
-    # 保存音频文件
-    audio_data = audio_data.to(torch.float32).div(torch.max(torch.abs(audio_data))).mul(32767).to(torch.int16).cpu()
-    torchaudio.save(filename, audio_data, sample_rate)
-    print(f'save audio to {filename}')
-    # 记录到 wandb
-    wandb.log({
-        f"{key_prefix}audio": wandb.Audio(filename, sample_rate=sample_rate, caption=caption),
-        f"{key_prefix}melspec": wandb.Image(audio_spectrogram_image(audio_data))
-    })
